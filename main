@@ -1,19 +1,32 @@
 """
-Monte Carlo simulation for insurance Claims Frequency & Severity forecasting.
+Monte Carlo simulation for insurance Claims Frequency & Severity forecasting,
+extended with:
+  (a) a sieve bootstrap over the trend/seasonal/AR(1) parameters, so forecast
+      uncertainty reflects BOTH residual noise AND the fact that the fitted
+      coefficients themselves are estimated from only 84 monthly observations
+  (b) Q-Q plots (+ Shapiro-Wilk tests) checking whether the log-residuals that
+      drive the whole simulation are actually approximately Gaussian, which is
+      the assumption that makes the simulated levels approximately lognormal.
 
 Approach
 --------
 1. Parse the monthly historical series (Jan-2020 .. Dec-2026).
 2. Decompose each series into: trend (log-linear growth) + seasonality (12 monthly
    factors) + residual noise.
-3. Fit residual volatility, and the CORRELATION between frequency residuals and
-   severity residuals (frequency and severity often move together, e.g. inflation
-   or claims-mix shifts affect both), and residual autocorrelation (AR(1)) so that
-   simulated paths don't just look like white noise.
-4. Monte Carlo: simulate N paths of the next H months by combining the fitted
-   trend + seasonality with randomly generated (correlated, autocorrelated) noise.
-5. Summarize as percentile bands (fan chart) and produce a simulated distribution
-   for any future month or the future annual average.
+3. Fit residual volatility, the CORRELATION between frequency and severity
+   residuals, and residual autocorrelation (AR(1)).
+3b. Sieve bootstrap: resample the AR(1) innovations with replacement, rebuild
+    pseudo history, re-fit trend/seasonal + AR(1) + correlation on each
+    resample -> a distribution of plausible parameter sets.
+3c. Q-Q plots of the fitted residuals against a Normal distribution, to check
+    the Gaussian-innovation assumption.
+4. Monte Carlo: for each simulated path, draw ONE bootstrap parameter set and
+   simulate the next H months using THAT path's own trend/seasonal/AR/cov,
+   combined with fresh correlated, autocorrelated random shocks. This nests
+   parameter uncertainty inside the Monte Carlo (a standard "bootstrap the
+   parameters, then simulate" hierarchy).
+5. Summarize as percentile bands (fan chart), compare band width against the
+   original fixed-parameter approach, and produce simulated distributions.
 """
 
 import numpy as np
@@ -23,6 +36,9 @@ import matplotlib.dates as mdates
 from scipy import stats
 
 np.random.seed(42)
+rng = np.random.default_rng(42)
+
+OUT = "/home/claude/mc"
 
 # ---------------------------------------------------------------------------
 # 1. RAW DATA (monthly values, Jan-2020 through Dec-2026)
@@ -59,13 +75,13 @@ df["t"] = np.arange(len(df))          # time index 0..83
 # ---------------------------------------------------------------------------
 # 2. TREND + SEASONALITY DECOMPOSITION (multiplicative, on log scale)
 # ---------------------------------------------------------------------------
-def fit_trend_seasonality(series, t, month):
-    """Fit log(y) = a + b*t + seasonal_dummies + residual."""
-    log_y = np.log(series.values)
-    X = np.column_stack([np.ones_like(t), t])
-    # seasonal dummies (drop Jan as baseline to avoid collinearity)
+def build_design(t, month):
+    X = np.column_stack([np.ones_like(t, dtype=float), t.astype(float)])
     for m in range(2, 13):
         X = np.column_stack([X, (month == m).astype(float)])
+    return X
+
+def fit_trend_seasonality(log_y, X):
     coef, *_ = np.linalg.lstsq(X, log_y, rcond=None)
     fitted = X @ coef
     resid = log_y - fitted
@@ -73,9 +89,10 @@ def fit_trend_seasonality(series, t, month):
 
 t = df["t"].values
 month = df["month"].values
+X_design = build_design(t, month)
 
-freq_coef, freq_fitted, freq_resid = fit_trend_seasonality(df["freq"], t, month)
-sev_coef, sev_fitted, sev_resid = fit_trend_seasonality(df["sev"], t, month)
+freq_coef, freq_fitted, freq_resid = fit_trend_seasonality(np.log(df["freq"].values), X_design)
+sev_coef, sev_fitted, sev_resid = fit_trend_seasonality(np.log(df["sev"].values), X_design)
 
 df["freq_fitted"] = np.exp(freq_fitted)
 df["sev_fitted"] = np.exp(sev_fitted)
@@ -94,14 +111,11 @@ def ar1_fit(resid):
     phi = np.sum(x * y) / np.sum(x * x)
     innovations = y - phi * x
     sigma = np.std(innovations, ddof=1)
-    return phi, sigma
+    return phi, sigma, innovations
 
-freq_phi, freq_sigma = ar1_fit(freq_resid)
-sev_phi, sev_sigma = ar1_fit(sev_resid)
+freq_phi, freq_sigma, innov_f = ar1_fit(freq_resid)
+sev_phi, sev_sigma, innov_s = ar1_fit(sev_resid)
 
-# correlation between the two series' innovations (contemporaneous)
-innov_f = freq_resid[1:] - freq_phi * freq_resid[:-1]
-innov_s = sev_resid[1:] - sev_phi * sev_resid[:-1]
 rho = np.corrcoef(innov_f, innov_s)[0, 1]
 
 print(f"\nResidual AR(1) persistence: freq phi={freq_phi:.2f}, sev phi={sev_phi:.2f}")
@@ -112,48 +126,182 @@ cov = np.array([[freq_sigma**2, rho*freq_sigma*sev_sigma],
 L = np.linalg.cholesky(cov)
 
 # ---------------------------------------------------------------------------
-# 4. MONTE CARLO SIMULATION
+# 3b. Q-Q PLOTS: is the Gaussian-innovation assumption reasonable?
+# ---------------------------------------------------------------------------
+# We check the AR(1) INNOVATIONS (the part actually assumed i.i.d. Normal),
+# not the raw residuals (which are autocorrelated by construction and would
+# fail a normality check for a different reason).
+fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+
+(osm_f, osr_f), (slope_f, intercept_f, r_f) = stats.probplot(innov_f, dist="norm")
+axes[0].scatter(osm_f, osr_f, s=18, color="#4C72B0", alpha=0.8)
+axes[0].plot(osm_f, slope_f*osm_f + intercept_f, color="black", lw=1, ls="--")
+axes[0].set_title(f"Q-Q Plot — Frequency AR(1) innovations\n(R²={r_f**2:.3f})")
+axes[0].set_xlabel("Theoretical quantiles (Normal)")
+axes[0].set_ylabel("Sample quantiles")
+axes[0].grid(alpha=0.3)
+
+(osm_s, osr_s), (slope_s, intercept_s, r_s) = stats.probplot(innov_s, dist="norm")
+axes[1].scatter(osm_s, osr_s, s=18, color="#DD8452", alpha=0.8)
+axes[1].plot(osm_s, slope_s*osm_s + intercept_s, color="black", lw=1, ls="--")
+axes[1].set_title(f"Q-Q Plot — Severity AR(1) innovations\n(R²={r_s**2:.3f})")
+axes[1].set_xlabel("Theoretical quantiles (Normal)")
+axes[1].set_ylabel("Sample quantiles")
+axes[1].grid(alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(f"{OUT}/qq_innovations.png", dpi=150)
+
+sw_f = stats.shapiro(innov_f)
+sw_s = stats.shapiro(innov_s)
+print("\nShapiro-Wilk normality test on AR(1) innovations (H0: Normal):")
+print(f"  Frequency: W={sw_f.statistic:.3f}, p={sw_f.pvalue:.3f}"
+      f"  -> {'no evidence against Normality' if sw_f.pvalue > 0.05 else 'REJECTS Normality at 5%'}")
+print(f"  Severity:  W={sw_s.statistic:.3f}, p={sw_s.pvalue:.3f}"
+      f"  -> {'no evidence against Normality' if sw_s.pvalue > 0.05 else 'REJECTS Normality at 5%'}")
+print("Saved: qq_innovations.png")
+print("NOTE: with only ~82 innovations this test has low power. Treat the Q-Q")
+print("plot's shape (fat tails? one big outlier? skew?) as more informative")
+print("than the p-value alone. A skewed severity residual is common when a")
+print("level shift (e.g. the 2026 jump) leaks into the residual.")
+
+# ---------------------------------------------------------------------------
+# 3c. SIEVE BOOTSTRAP over trend/seasonal + AR(1) + covariance parameters
+# ---------------------------------------------------------------------------
+# Standard time-series ("sieve") bootstrap: fit an AR model, resample its
+# (approximately i.i.d.) innovations with replacement, reconstruct a
+# pseudo-residual path via the AR(1) recursion, add it back onto the ORIGINAL
+# fitted trend+seasonal, then RE-FIT the whole model (trend, seasonal, AR(1),
+# correlation) on that pseudo-series. Repeating this many times gives an
+# empirical distribution over every parameter used downstream, capturing
+# estimation ("parameter") uncertainty rather than only residual noise.
+#
+# Innovation PAIRS (freq, sev) are resampled jointly (same row index for both
+# series) so the contemporaneous cross-correlation between them is preserved
+# without having to assume a parametric copula for the resampling step itself.
+
+N_BOOT = 500
+n_obs = len(freq_resid)
+innovations_paired = np.column_stack([innov_f, innov_s])   # shape (n_obs-1, 2)
+n_innov = len(innovations_paired)
+
+boot_freq_coef = np.zeros((N_BOOT, freq_coef.shape[0]))
+boot_sev_coef = np.zeros((N_BOOT, sev_coef.shape[0]))
+boot_freq_phi = np.zeros(N_BOOT)
+boot_sev_phi = np.zeros(N_BOOT)
+boot_L = np.zeros((N_BOOT, 2, 2))
+n_fallback = 0
+
+for b in range(N_BOOT):
+    idx = rng.integers(0, n_innov, size=n_innov)
+    boot_innov = innovations_paired[idx]
+
+    # rebuild pseudo residual paths via the AR(1) recursion (fixed phi from
+    # the original fit is used to PROPAGATE the resampled shocks; phi itself
+    # gets re-estimated below once we have pseudo-data)
+    boot_resid_f = np.empty(n_obs)
+    boot_resid_s = np.empty(n_obs)
+    boot_resid_f[0] = freq_resid[0]
+    boot_resid_s[0] = sev_resid[0]
+    for i in range(1, n_obs):
+        boot_resid_f[i] = freq_phi * boot_resid_f[i-1] + boot_innov[i-1, 0]
+        boot_resid_s[i] = sev_phi * boot_resid_s[i-1] + boot_innov[i-1, 1]
+
+    # pseudo log-series = original fitted trend/seasonal + pseudo residual
+    boot_log_freq = freq_fitted + boot_resid_f
+    boot_log_sev = sev_fitted + boot_resid_s
+
+    # re-fit trend + seasonal on the pseudo data
+    c_f, fit_f, new_resid_f = fit_trend_seasonality(boot_log_freq, X_design)
+    c_s, fit_s, new_resid_s = fit_trend_seasonality(boot_log_sev, X_design)
+    boot_freq_coef[b] = c_f
+    boot_sev_coef[b] = c_s
+
+    # re-fit AR(1) + correlation on the new residuals
+    phi_f_b, sigma_f_b, ni_f = ar1_fit(new_resid_f)
+    phi_s_b, sigma_s_b, ni_s = ar1_fit(new_resid_s)
+    boot_freq_phi[b] = phi_f_b
+    boot_sev_phi[b] = phi_s_b
+
+    rho_b = np.corrcoef(ni_f, ni_s)[0, 1]
+    cov_b = np.array([[sigma_f_b**2, rho_b*sigma_f_b*sigma_s_b],
+                       [rho_b*sigma_f_b*sigma_s_b, sigma_s_b**2]])
+    try:
+        boot_L[b] = np.linalg.cholesky(cov_b)
+    except np.linalg.LinAlgError:
+        boot_L[b] = L   # tiny-sample non-PD fallback
+        n_fallback += 1
+
+print(f"\nSieve bootstrap: {N_BOOT} resamples "
+      f"({n_fallback} fell back to point-estimate covariance due to a "
+      f"non-positive-definite draw).")
+print("Bootstrap spread of annualized trend growth (90% interval):")
+freq_trend_boot = np.exp(boot_freq_coef[:, 1]*12) - 1
+sev_trend_boot = np.exp(boot_sev_coef[:, 1]*12) - 1
+print(f"  Frequency: [{np.percentile(freq_trend_boot,5):+.2%}, {np.percentile(freq_trend_boot,95):+.2%}]"
+      f"  (point estimate {np.exp(freq_coef[1]*12)-1:+.2%})")
+print(f"  Severity:  [{np.percentile(sev_trend_boot,5):+.2%}, {np.percentile(sev_trend_boot,95):+.2%}]"
+      f"  (point estimate {np.exp(sev_coef[1]*12)-1:+.2%})")
+
+# ---------------------------------------------------------------------------
+# 4. MONTE CARLO SIMULATION (parameter uncertainty + residual uncertainty)
 # ---------------------------------------------------------------------------
 N_SIMS = 10000
-HORIZON = 60  # months forward, starting Jan-2027 (5-year forecast)
+HORIZON = 60
 future_dates = pd.date_range("2027-01-01", periods=HORIZON, freq="MS")
 future_t = np.arange(len(df), len(df) + HORIZON)
 future_month = future_dates.month.values
 
-def seasonal_log(coef, month_arr):
-    out = np.zeros(len(month_arr))
-    for i, m in enumerate(month_arr):
-        if m == 1:
-            continue
-        out[i] = coef[m]  # coef index: 2..12 correspond to positions 2..12 in coef array
-    return out
-
-# rebuild seasonal contribution lookup (coef layout: [a, b, s2..s12])
 def trend_seasonal_log(coef, t_arr, month_arr):
     a, b = coef[0], coef[1]
     s = np.zeros(len(t_arr))
     for i, m in enumerate(month_arr):
         if m >= 2:
-            s[i] = coef[m]  # since dummies were appended in order month=2..12 -> coef[2]..coef[12]
+            s[i] = coef[m]
     return a + b * t_arr + s
-
-freq_base_log = trend_seasonal_log(freq_coef, future_t, future_month)
-sev_base_log = trend_seasonal_log(sev_coef, future_t, future_month)
-
-sims_freq = np.zeros((N_SIMS, HORIZON))
-sims_sev = np.zeros((N_SIMS, HORIZON))
 
 last_freq_resid = freq_resid[-1]
 last_sev_resid = sev_resid[-1]
 
+# --- (A) ORIGINAL fixed-parameter simulation, kept as a baseline for comparison ---
+sims_freq_fixed = np.zeros((N_SIMS, HORIZON))
+sims_sev_fixed = np.zeros((N_SIMS, HORIZON))
+freq_base_log = trend_seasonal_log(freq_coef, future_t, future_month)
+sev_base_log = trend_seasonal_log(sev_coef, future_t, future_month)
+
 for s in range(N_SIMS):
     rf, rs = last_freq_resid, last_sev_resid
     for h in range(HORIZON):
-        z = L @ np.random.normal(size=2)
+        z = L @ rng.normal(size=2)
         rf = freq_phi * rf + z[0]
         rs = sev_phi * rs + z[1]
-        sims_freq[s, h] = np.exp(freq_base_log[h] + rf)
-        sims_sev[s, h] = np.exp(sev_base_log[h] + rs)
+        sims_freq_fixed[s, h] = np.exp(freq_base_log[h] + rf)
+        sims_sev_fixed[s, h] = np.exp(sev_base_log[h] + rs)
+
+# --- (B) BOOTSTRAP-AUGMENTED simulation: each path draws its own parameter set ---
+sims_freq_boot = np.zeros((N_SIMS, HORIZON))
+sims_sev_boot = np.zeros((N_SIMS, HORIZON))
+boot_draw = rng.integers(0, N_BOOT, size=N_SIMS)
+
+for s in range(N_SIMS):
+    b_i = boot_draw[s]
+    coef_f_s, coef_s_s = boot_freq_coef[b_i], boot_sev_coef[b_i]
+    phi_f_s, phi_s_s = boot_freq_phi[b_i], boot_sev_phi[b_i]
+    L_s = boot_L[b_i]
+
+    freq_base_log_s = trend_seasonal_log(coef_f_s, future_t, future_month)
+    sev_base_log_s = trend_seasonal_log(coef_s_s, future_t, future_month)
+
+    rf, rs = last_freq_resid, last_sev_resid
+    for h in range(HORIZON):
+        z = L_s @ rng.normal(size=2)
+        rf = phi_f_s * rf + z[0]
+        rs = phi_s_s * rs + z[1]
+        sims_freq_boot[s, h] = np.exp(freq_base_log_s[h] + rf)
+        sims_sev_boot[s, h] = np.exp(sev_base_log_s[h] + rs)
+
+# use the bootstrap-augmented sims as the "headline" simulation from here on
+sims_freq, sims_sev = sims_freq_boot, sims_sev_boot
 
 # ---------------------------------------------------------------------------
 # 5. SUMMARIZE
@@ -161,6 +309,8 @@ for s in range(N_SIMS):
 pct = [5, 25, 50, 75, 95]
 freq_pctiles = np.percentile(sims_freq, pct, axis=0)
 sev_pctiles = np.percentile(sims_sev, pct, axis=0)
+freq_pctiles_fixed = np.percentile(sims_freq_fixed, pct, axis=0)
+sev_pctiles_fixed = np.percentile(sims_sev_fixed, pct, axis=0)
 
 summary = pd.DataFrame({
     "date": future_dates,
@@ -169,15 +319,24 @@ summary = pd.DataFrame({
     "sev_p5": sev_pctiles[0], "sev_p25": sev_pctiles[1], "sev_p50": sev_pctiles[2],
     "sev_p75": sev_pctiles[3], "sev_p95": sev_pctiles[4],
 })
-summary.to_csv("/home/claude/mc/simulation_summary.csv", index=False)
-print("\nFirst 6 months of simulated forecast (median + 90% interval):")
+summary.to_csv(f"{OUT}/simulation_summary_bootstrap.csv", index=False)
+print("\nFirst 6 months of simulated forecast (median + 90% interval, WITH parameter bootstrap):")
 print(summary.head(6).to_string(index=False))
 
-# --- Annual roll-up (avg frequency, avg severity per calendar year, across sims) ---
+# --- widen-ness comparison: how much extra spread does parameter uncertainty add? ---
+h_check = [11, 35, 59]   # end of year 1, 3, 5
+print("\nP5-P95 band width, fixed-parameter vs bootstrap-augmented (severity, $):")
+for h in h_check:
+    w_fixed = sev_pctiles_fixed[4, h] - sev_pctiles_fixed[0, h]
+    w_boot = sev_pctiles[4, h] - sev_pctiles[0, h]
+    print(f"  {future_dates[h].strftime('%b-%Y')}: fixed={w_fixed:8.0f}  "
+          f"bootstrap={w_boot:8.0f}  (+{(w_boot/w_fixed - 1):.0%})")
+
+# --- Annual roll-up ---
 sims_freq_df = pd.DataFrame(sims_freq.T, index=future_dates)
 sims_sev_df = pd.DataFrame(sims_sev.T, index=future_dates)
-annual_freq_by_sim = sims_freq_df.groupby(sims_freq_df.index.year).mean()   # yearly avg freq per sim
-annual_sev_by_sim = sims_sev_df.groupby(sims_sev_df.index.year).mean()     # yearly avg sev per sim
+annual_freq_by_sim = sims_freq_df.groupby(sims_freq_df.index.year).mean()
+annual_sev_by_sim = sims_sev_df.groupby(sims_sev_df.index.year).mean()
 
 annual_summary = pd.DataFrame({
     "freq_p5": annual_freq_by_sim.quantile(0.05, axis=1),
@@ -192,39 +351,40 @@ annual_summary = pd.DataFrame({
     "sev_p95": annual_sev_by_sim.quantile(0.95, axis=1),
 })
 annual_summary.index.name = "year"
-annual_summary.to_csv("/home/claude/mc/annual_summary.csv")
-print("\nAnnual average forecast (median + 90% interval) by year:")
+annual_summary.to_csv(f"{OUT}/annual_summary_bootstrap.csv")
+print("\nAnnual average forecast (median + 90% interval) by year, WITH parameter bootstrap:")
 print(annual_summary.round(4).to_string())
 
-# also save full sim draws for pure premium calc downstream
-np.save("/home/claude/mc/sims_freq.npy", sims_freq)
-np.save("/home/claude/mc/sims_sev.npy", sims_sev)
+np.save(f"{OUT}/sims_freq_bootstrap.npy", sims_freq)
+np.save(f"{OUT}/sims_sev_bootstrap.npy", sims_sev)
 
 # ---------------------------------------------------------------------------
-# 6. PLOT FAN CHARTS
+# 6. PLOT: fan chart comparison, fixed-parameter vs bootstrap-augmented
 # ---------------------------------------------------------------------------
 fig, axes = plt.subplots(2, 1, figsize=(11, 9), sharex=False)
 
-# Frequency plot
 ax = axes[0]
 ax.plot(df.index, df["freq"]*100, color="black", lw=1.3, label="Historical")
-ax.fill_between(future_dates, freq_pctiles[0]*100, freq_pctiles[4]*100, color="#4C72B0", alpha=0.2, label="P5-P95")
-ax.fill_between(future_dates, freq_pctiles[1]*100, freq_pctiles[3]*100, color="#4C72B0", alpha=0.4, label="P25-P75")
-ax.plot(future_dates, freq_pctiles[2]*100, color="#4C72B0", lw=2, label="Median forecast")
-ax.set_title("Claims Frequency — Historical + 5-Year Monte Carlo Forecast (10,000 sims)")
+ax.fill_between(future_dates, freq_pctiles_fixed[0]*100, freq_pctiles_fixed[4]*100,
+                 color="gray", alpha=0.35, label="P5-P95 (fixed params, original method)")
+ax.fill_between(future_dates, freq_pctiles[0]*100, freq_pctiles[4]*100,
+                 color="#4C72B0", alpha=0.25, label="P5-P95 (+ parameter bootstrap)")
+ax.plot(future_dates, freq_pctiles[2]*100, color="#4C72B0", lw=2, label="Median forecast (bootstrap)")
+ax.set_title("Claims Frequency — Parameter Uncertainty Widens the Fan")
 ax.set_ylabel("Frequency (%)")
-ax.legend(loc="upper left", fontsize=9)
+ax.legend(loc="upper left", fontsize=8)
 ax.grid(alpha=0.3)
 
-# Severity plot
 ax = axes[1]
 ax.plot(df.index, df["sev"], color="black", lw=1.3, label="Historical")
-ax.fill_between(future_dates, sev_pctiles[0], sev_pctiles[4], color="#DD8452", alpha=0.2, label="P5-P95")
-ax.fill_between(future_dates, sev_pctiles[1], sev_pctiles[3], color="#DD8452", alpha=0.4, label="P25-P75")
-ax.plot(future_dates, sev_pctiles[2], color="#DD8452", lw=2, label="Median forecast")
-ax.set_title("Claims Severity — Historical + 5-Year Monte Carlo Forecast (10,000 sims)")
+ax.fill_between(future_dates, sev_pctiles_fixed[0], sev_pctiles_fixed[4],
+                 color="gray", alpha=0.35, label="P5-P95 (fixed params, original method)")
+ax.fill_between(future_dates, sev_pctiles[0], sev_pctiles[4],
+                 color="#DD8452", alpha=0.25, label="P5-P95 (+ parameter bootstrap)")
+ax.plot(future_dates, sev_pctiles[2], color="#DD8452", lw=2, label="Median forecast (bootstrap)")
+ax.set_title("Claims Severity — Parameter Uncertainty Widens the Fan")
 ax.set_ylabel("Severity ($)")
-ax.legend(loc="upper left", fontsize=9)
+ax.legend(loc="upper left", fontsize=8)
 ax.grid(alpha=0.3)
 
 for ax in axes:
@@ -232,96 +392,8 @@ for ax in axes:
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
 
 plt.tight_layout()
-plt.savefig("/home/claude/mc/fan_chart.png", dpi=150)
-print("\nSaved: fan_chart.png, simulation_summary.csv, sims_freq.npy, sims_sev.npy")
+plt.savefig(f"{OUT}/fan_chart_bootstrap_comparison.png", dpi=150)
+print("\nSaved: fan_chart_bootstrap_comparison.png, qq_innovations.png,")
+print("       simulation_summary_bootstrap.csv, annual_summary_bootstrap.csv,")
+print("       sims_freq_bootstrap.npy, sims_sev_bootstrap.npy")
 
-"""
-Empirical distribution plots from the Monte Carlo simulation.
- 
-Loads the saved simulation arrays (sims_freq.npy, sims_sev.npy — shape N_SIMS x HORIZON)
-and plots histograms of the *simulated* (empirical) distribution of frequency and
-severity at several forecast horizons (year 1, 3, 5)
-
-Also overlays a fitted lognormal density for reference, since the simulation is
-built multiplicatively (log-scale trend/seasonality/AR(1) noise) so outcomes are
-approximately lognormal.
-"""
-
-sims_freq = np.load("/home/claude/mc/sims_freq.npy")   # shape (10000, 60)
-sims_sev = np.load("/home/claude/mc/sims_sev.npy")
- 
-HORIZON = sims_freq.shape[1]
-future_dates = pd.date_range("2027-01-01", periods=HORIZON, freq="MS")
- 
-# pick December of year 1, year 3, year 5 (indices into the 60-month array)
-target_months = ["2027-12", "2029-12", "2031-12"]
-idx = [list(future_dates.strftime("%Y-%m")).index(m) for m in target_months]
-colors = ["#9ecae1", "#4292c6", "#08519c"]
-colors_s = ["#fdae6b", "#f16913", "#a63603"]
- 
-fig, axes = plt.subplots(1, 2, figsize=(13, 5.2))
- 
-# ---- Frequency ----
-ax = axes[0]
-for i, c in zip(idx, colors):
-    data = sims_freq[:, i] * 100  # convert to %
-    ax.hist(data, bins=60, density=True, alpha=0.5, color=c,
-             label=f"{future_dates[i].strftime('%b-%Y')} (mean={data.mean():.1f}%)")
-ax.set_title("Empirical Distribution of Simulated Frequency\n(10,000 Monte Carlo draws)")
-ax.set_xlabel("Frequency (%)")
-ax.set_ylabel("Density")
-ax.legend(fontsize=9)
-ax.grid(alpha=0.3)
- 
-# ---- Severity ----
-ax = axes[1]
-for i, c in zip(idx, colors_s):
-    data = sims_sev[:, i]
-    ax.hist(data, bins=60, density=True, alpha=0.5, color=c,
-             label=f"{future_dates[i].strftime('%b-%Y')} (mean=${data.mean():,.0f})")
-ax.set_title("Empirical Distribution of Simulated Severity\n(10,000 Monte Carlo draws)")
-ax.set_xlabel("Severity ($)")
-ax.set_ylabel("Density")
-ax.legend(fontsize=9)
-ax.grid(alpha=0.3)
- 
-plt.tight_layout()
-plt.savefig("/home/claude/mc/empirical_distributions.png", dpi=150)
-print("Saved empirical_distributions.png")
- 
-# ---------------------------------------------------------------------------
-# Also: empirical CDF at the 5-year mark, useful for "what's the probability
-# frequency/severity exceeds X" type questions
-# ---------------------------------------------------------------------------
-fig, axes = plt.subplots(1, 2, figsize=(13, 5))
- 
-final_idx = HORIZON - 1
-ax = axes[0]
-data = np.sort(sims_freq[:, final_idx] * 100)
-cdf = np.arange(1, len(data) + 1) / len(data)
-ax.plot(data, cdf, color="#08519c")
-ax.set_title(f"Empirical CDF — Frequency, {future_dates[final_idx].strftime('%b-%Y')}")
-ax.set_xlabel("Frequency (%)")
-ax.set_ylabel("Cumulative probability")
-ax.grid(alpha=0.3)
-for q in [0.05, 0.5, 0.95]:
-    val = np.percentile(data, q * 100)
-    ax.axvline(val, color="gray", ls="--", lw=0.8)
-    ax.text(val, q, f" P{int(q*100)}={val:.1f}%", fontsize=8, va="bottom")
- 
-ax = axes[1]
-data = np.sort(sims_sev[:, final_idx])
-cdf = np.arange(1, len(data) + 1) / len(data)
-ax.plot(data, cdf, color="#a63603")
-ax.set_title(f"Empirical CDF — Severity, {future_dates[final_idx].strftime('%b-%Y')}")
-ax.set_xlabel("Severity ($)")
-ax.set_ylabel("Cumulative probability")
-ax.grid(alpha=0.3)
-for q in [0.05, 0.5, 0.95]:
-    val = np.percentile(data, q * 100)
-    ax.axvline(val, color="gray", ls="--", lw=0.8)
-    ax.text(val, q, f" P{int(q*100)}=${val:,.0f}", fontsize=8, va="bottom")
- 
-plt.tight_layout()
-plt.savefig("/home/claude/mc/empirical_cdf.png", dpi=150)
-print("Saved empirical_cdf.png")
