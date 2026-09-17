@@ -139,4 +139,5 @@ Key parameters you may want to change:
 
 ## License
 
-*(Add your preferred license — e.g. MIT — here.)*
+MIT © 2026 — see [LICENSE](LICENSE) for details.
+
