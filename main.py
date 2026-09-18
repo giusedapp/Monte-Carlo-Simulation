@@ -21,7 +21,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from scipy import stats
+import os
 
+OUT = "output" 
+os.makedirs(OUT, exist_ok=True)
 np.random.seed(42)
 
 # ---------------------------------------------------------------------------
@@ -169,7 +172,7 @@ summary = pd.DataFrame({
     "sev_p5": sev_pctiles[0], "sev_p25": sev_pctiles[1], "sev_p50": sev_pctiles[2],
     "sev_p75": sev_pctiles[3], "sev_p95": sev_pctiles[4],
 })
-summary.to_csv("/home/claude/mc/simulation_summary.csv", index=False)
+summary.to_csv(f"{OUT}/simulation_summary.csv", index=False)
 print("\nFirst 6 months of simulated forecast (median + 90% interval):")
 print(summary.head(6).to_string(index=False))
 
@@ -192,13 +195,13 @@ annual_summary = pd.DataFrame({
     "sev_p95": annual_sev_by_sim.quantile(0.95, axis=1),
 })
 annual_summary.index.name = "year"
-annual_summary.to_csv("/home/claude/mc/annual_summary.csv")
+annual_summary.to_csv(f"{OUT}/annual_summary.csv")
 print("\nAnnual average forecast (median + 90% interval) by year:")
 print(annual_summary.round(4).to_string())
 
 # also save full sim draws for pure premium calc downstream
-np.save("/home/claude/mc/sims_freq.npy", sims_freq)
-np.save("/home/claude/mc/sims_sev.npy", sims_sev)
+np.save(f"{OUT}/sims_freq.npy", sims_freq)
+np.save(f"{OUT}/sims_sev.npy", sims_sev)
 
 # ---------------------------------------------------------------------------
 # 6. PLOT FAN CHARTS
@@ -232,7 +235,7 @@ for ax in axes:
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
 
 plt.tight_layout()
-plt.savefig("/home/claude/mc/fan_chart.png", dpi=150)
+plt.savefig(f"{OUT}/fan_chart.png", dpi=150)
 print("\nSaved: fan_chart.png, simulation_summary.csv, sims_freq.npy, sims_sev.npy")
 
 """
@@ -247,8 +250,8 @@ built multiplicatively (log-scale trend/seasonality/AR(1) noise) so outcomes are
 approximately lognormal.
 """
 
-sims_freq = np.load("/home/claude/mc/sims_freq.npy")   # shape (10000, 60)
-sims_sev = np.load("/home/claude/mc/sims_sev.npy")
+sims_freq = np.load(f"{OUT}/sims_freq.npy")   # shape (10000, 60)
+sims_sev = np.load(f"{OUT}/sims_sev.npy")
  
 HORIZON = sims_freq.shape[1]
 future_dates = pd.date_range("2027-01-01", periods=HORIZON, freq="MS")
@@ -286,7 +289,7 @@ ax.legend(fontsize=9)
 ax.grid(alpha=0.3)
  
 plt.tight_layout()
-plt.savefig("/home/claude/mc/empirical_distributions.png", dpi=150)
+plt.savefig(f"{OUT}/empirical_distributions.png", dpi=150) 
 print("Saved empirical_distributions.png")
  
 # ---------------------------------------------------------------------------
@@ -323,5 +326,5 @@ for q in [0.05, 0.5, 0.95]:
     ax.text(val, q, f" P{int(q*100)}=${val:,.0f}", fontsize=8, va="bottom")
  
 plt.tight_layout()
-plt.savefig("/home/claude/mc/empirical_cdf.png", dpi=150)
+plt.savefig(f"{OUT}/empirical_cdf.png", dpi=150)
 print("Saved empirical_cdf.png")
