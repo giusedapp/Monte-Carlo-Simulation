@@ -82,7 +82,7 @@ scipy
 
 Install with:
 ```bash
-pip install numpy pandas matplotlib scipy
+pip install -r requirements.txt
 ```
 
 ## Usage
