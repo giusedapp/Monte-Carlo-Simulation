@@ -45,7 +45,7 @@ uncertainty in the fitted trend compounds the further out you forecast.
 **Forecast fan chart** — historical series plus simulated median and P5–P95 /
 P25–P75 bands, fixed-parameter vs. bootstrap-augmented:
 
-![Fan chart](fan_chart_bootstrap_comparison.png)
+![Forecast fan chart](images/fan_chart_bootstrap_comparison.png)
 
 **Diagnostic check** — Q-Q plots of the AR(1) innovations against a Normal
 distribution. Both series show a heavy left-tail outlier (the Jan-2026
@@ -53,7 +53,7 @@ severity/frequency jump), which is why Shapiro-Wilk rejects normality at the
 5% level for both — a reason to treat simulated tail percentiles (P5/P95) as
 indicative rather than precise:
 
-![Q-Q plot](qq_innovations.png)
+![Q-Q diagnostic plot](images/qq_innovations.png)
 
 Full monthly and annual percentile tables are in
 `simulation_summary_bootstrap.csv` and `annual_summary_bootstrap.csv`.
