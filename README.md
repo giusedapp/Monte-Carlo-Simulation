@@ -47,6 +47,14 @@ P25–P75 bands, fixed-parameter vs. bootstrap-augmented:
 
 ![Forecast fan chart](images/fan_chart.png)
 
+**Simulated distribution shape** — histograms of the simulated (empirical) frequency and severity at the 1, 3, and 5-year horizons, showing how the spread widens and the distribution's shape evolves further out in the forecast: 
+
+![Empirical distributions](images/empirical_distributions.png)
+
+**Empirical CDF (5-year horizon)** — the cumulative distribution of simulated outcomes at Dec-2031, useful for reading off "what's the probability severity exceeds $X" type questions directly from the simulation: 
+
+![Empirical CDF](images/empirical_cdf.png)
+
 **Diagnostic check** — Q-Q plots of the AR(1) innovations against a Normal
 distribution. Both series show a heavy left-tail outlier (the Jan-2026
 severity/frequency jump), which is why Shapiro-Wilk rejects normality at the
