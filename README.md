@@ -45,7 +45,7 @@ uncertainty in the fitted trend compounds the further out you forecast.
 **Forecast fan chart** — historical series plus simulated median and P5–P95 /
 P25–P75 bands, fixed-parameter vs. bootstrap-augmented:
 
-![Forecast fan chart](images/fan_chart_bootstrap_comparison.png)
+![Forecast fan chart](images/fan_chart.png)
 
 **Diagnostic check** — Q-Q plots of the AR(1) innovations against a Normal
 distribution. Both series show a heavy left-tail outlier (the Jan-2026
